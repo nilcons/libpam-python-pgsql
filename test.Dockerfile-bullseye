@@ -1,0 +1,52 @@
+FROM debian:bullseye
+
+RUN apt-get update
+RUN apt-get install -y pamtester postgresql postgresql-client gosu db-util python3-pygresql
+
+# in bullseye libpam-python is compiled with python2, but everything else with python3, what a clusterfck
+# solution: we backport libpam-python from bookworm
+
+# sources from bookworm
+RUN echo deb-src http://deb.debian.org/debian bookworm main >>/etc/apt/sources.list
+RUN apt-get update
+
+# build dependencies
+RUN apt-get install -y build-essential
+RUN apt-get build-dep -y libpam-python
+
+# build and install
+RUN mkdir /tmp/libpam-python && \
+    cd /tmp/libpam-python && \
+    apt-get source libpam-python && \
+    cd pam-python-1.1* && \
+    dpkg-buildpackage -us -uc && \
+    dpkg -i ../libpam-python_1.1*deb
+
+RUN pg_ctlcluster 13 main start && \
+        gosu postgres psql -c 'create database pamtest' postgres && \
+        gosu postgres psql -c 'CREATE TABLE pamauth (username TEXT, pwd TEXT);' pamtest && \
+        gosu postgres psql -c "INSERT INTO pamauth VALUES ('testuser', 'topsecret');" pamtest && \
+        gosu postgres psql -c 'SELECT * FROM pamauth;' pamtest
+
+RUN echo -n | db_load -T -t hash /etc/empty_fake_userdb.db
+RUN echo auth optional pam_userdb.so crypt=none db=/etc/empty_fake_userdb > /etc/pam.d/pampypgsql && \
+    echo auth requisite pam_python.so /usr/local/lib/pampypgsql.py db=pamtest dbuser=postgres table=pamauth usercolumn=username pwdcolumn=pwd >> /etc/pam.d/pampypgsql && \
+    echo account requisite pam_permit.so >> /etc/pam.d/pampypgsql && \
+    echo password requisite pam_deny.so >> /etc/pam.d/pampypgsql && \
+    echo session requisite pam_permit.so >> /etc/pam.d/pampypgsql
+
+COPY pampypgsql.py /usr/local/lib
+
+ARG CACHEBUST=1
+
+# good username and password succeeds
+RUN /bin/bash -c "pg_ctlcluster 13 main start && gosu postgres pamtester pampypgsql testuser authenticate <<<topsecret"
+
+# bad password fails
+RUN /bin/bash -c "pg_ctlcluster 13 main start && gosu postgres pamtester pampypgsql testuser authenticate <<<badguy" 2>&1 | tee /dev/stderr | grep Authentication\ failure
+
+# bad username fails
+RUN /bin/bash -c "pg_ctlcluster 13 main start && gosu postgres pamtester pampypgsql nonexistent authenticate <<<badguy" 2>&1 | tee /dev/stderr | grep Authentication\ failure
+
+# even with good passowrd
+RUN /bin/bash -c "pg_ctlcluster 13 main start && gosu postgres pamtester pampypgsql nonexistent authenticate <<<topsecret" 2>&1 | tee /dev/stderr | grep Authentication\ failure
